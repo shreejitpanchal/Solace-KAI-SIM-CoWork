@@ -4,12 +4,14 @@ Run the integration test with a broker from `scripts/dev.sh up`:
     SOLACE_INTEGRATION=1 uv run pytest tests/test_broker.py
 """
 
+import dataclasses
+import logging
 import os
 import threading
 
 import pytest
 
-from kai_sim_cowork.broker import Broker, Inbound, Outbound, to_inbound
+from kai_sim_cowork.broker import Broker, Inbound, Outbound, deliver, to_inbound
 from kai_sim_cowork.config import broker_config
 
 TOPIC = "cowork/itest/apse1/orchestration/task/created/v1"
@@ -38,6 +40,24 @@ def test_to_inbound_tolerates_empty_payload_and_properties():
     assert to_inbound(FakeSdkMessage("t", None, None)) == Inbound("t", b"", {})
 
 
+def test_deliver_reports_a_handled_message_for_ack():
+    seen = []
+    assert deliver(seen.append, Inbound(TOPIC, b"{}"), "q.x") is True
+    assert seen == [Inbound(TOPIC, b"{}")]
+
+
+def test_deliver_reports_a_raising_handler_for_failed_settlement(caplog):
+    def broken(msg: Inbound) -> None:
+        raise RuntimeError("publish timed out")
+
+    with caplog.at_level(logging.ERROR):
+        assert deliver(broken, Inbound(TOPIC, b"{}"), "q.x") is False
+    assert "settling FAILED" in caplog.text
+    assert "dead message queue" in caplog.text
+    assert TOPIC in caplog.text and "q.x" in caplog.text
+    assert "publish timed out" in caplog.text  # the cause survives into the log
+
+
 def test_broker_close_is_safe_before_connect():
     Broker(broker_config({})).close()
 
@@ -48,12 +68,21 @@ def test_stop_unblocks_wait():
     broker.wait()  # returns instead of hanging
 
 
+def _itest_config():
+    """The broker's built-in `default` user, allowed to create its own throwaway queue.
+
+    The simulation's services never connect this way: their provisioned
+    profiles may not create endpoints or add subscriptions.
+    """
+    return dataclasses.replace(broker_config(), create_queues=True)
+
+
 @pytest.mark.skipif(not os.environ.get("SOLACE_INTEGRATION"), reason="needs a live broker")
 def test_round_trip_through_a_dynamically_created_queue():
     """Publish persistently, consume from a queue created on start; the queue survives."""
     received = []
     got = threading.Event()
-    cfg = broker_config()
+    cfg = _itest_config()
     queue = f"{cfg.queue_prefix}.itest"
     broker = Broker(cfg).connect()
     try:
@@ -71,7 +100,7 @@ def test_round_trip_through_a_dynamically_created_queue():
 @pytest.mark.skipif(not os.environ.get("SOLACE_INTEGRATION"), reason="needs a live broker")
 def test_queue_spools_while_consumer_is_down():
     """The point of queues: an event published before the consumer binds is still delivered."""
-    cfg = broker_config()
+    cfg = _itest_config()
     queue = f"{cfg.queue_prefix}.itest-spool"
     sub = "cowork/itest/apse1/orchestration/>"
     setup = Broker(cfg).connect()  # first bind creates the queue and its subscription

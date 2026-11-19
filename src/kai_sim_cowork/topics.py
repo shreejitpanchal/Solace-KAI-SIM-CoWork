@@ -30,7 +30,12 @@ Queues
 ------
     <prefix>.<environment>.<region>.<service>    e.g. q.cowork.dev.apse1.orchestrator
 One durable exclusive queue per consuming service (brief, section 7), carrying
-that service's subscriptions. The list lives in services.py.
+that service's subscriptions. Each service package (services/<name>/) declares its own.
+
+    <queue>.dmq                                  e.g. q.cowork.dev.apse1.orchestrator.dmq
+One dead message queue per service queue. It has no subscriptions: the broker
+moves a message there when it expires on the service queue or exceeds the
+queue's redelivery limit (provision.py sets both), so nothing is lost silently.
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ from dataclasses import dataclass
 ROOT = "cowork"
 VERSION = "v1"
 COMMAND_LEVEL = "command"
+DMQ_SUFFIX = "dmq"
 
 # Letters, digits, '.', '_' and '-', 1 to 64 characters. Nothing else.
 _LEVEL = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -169,6 +175,10 @@ class TopicSpace:
     def queue_name(self, prefix: str, service: str) -> str:
         """<prefix>.<env>.<region>.<service>, e.g. q.cowork.dev.apse1.orchestrator."""
         return f"{prefix}.{self.environment}.{self.region}.{validate_level(service, 'service')}"
+
+    def dmq_name(self, prefix: str, service: str) -> str:
+        """The service queue's dead message queue: <queue>.dmq."""
+        return f"{self.queue_name(prefix, service)}.{DMQ_SUFFIX}"
 
     # --- parsing inbound topics ------------------------------------------
 

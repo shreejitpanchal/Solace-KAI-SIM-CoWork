@@ -1,8 +1,9 @@
-"""The registry's subscriptions and reactions, and the full task flow they produce together."""
+"""The registry: the services it lists, what is derived from them, and the flow they produce.
+
+Each service's own declaration and handlers are tested in tests/services/test_<service>.py.
+"""
 
 from __future__ import annotations
-
-import pytest
 
 from kai_sim_cowork import services as s
 from kai_sim_cowork.envelope import Envelope, Producer
@@ -13,10 +14,20 @@ def me(name: str) -> Producer:
     return Producer(name, "0.1.0", f"{name}-1")
 
 
-def react(service_name: str, env: Envelope, space: TopicSpace) -> list[Envelope]:
-    """Run one service's reaction the way the consumer would, after parsing the topic."""
-    parts = space.parse(space.topic_for(env.event_type))
-    return s.SERVICES[service_name].react(env, parts, me(service_name))
+def test_each_service_is_declared_by_its_own_package():
+    from kai_sim_cowork.services import (
+        agent_runtime,
+        api_gateway,
+        audit_pipeline,
+        orchestrator,
+        streaming_gateway,
+        tool_execution,
+    )
+
+    packages = (orchestrator, agent_runtime, tool_execution, streaming_gateway, audit_pipeline)
+    assert [s.SERVICES[p.NAME] for p in packages] == [p.SERVICE for p in packages]
+    assert s.GATEWAY == api_gateway.NAME and s.GATEWAY not in s.SERVICES
+    assert s.PUBLISHES[s.GATEWAY] == api_gateway.PUBLISHES
 
 
 def test_registry_names_the_five_services_and_their_subscriptions(space):
@@ -52,47 +63,46 @@ def test_queue_specs_give_each_service_its_own_queue(space):
         "q.cowork.dev.apse1.audit-pipeline",
     ]
     assert specs[4].subscriptions == ("cowork/dev/apse1/>",)
+    assert [q.dead_msg_queue for q in specs] == [f"{q.name}.dmq" for q in specs]
+    assert [q.owner for q in specs] == [f"cowork-{name}" for name in s.SERVICE_NAMES]
 
 
-def test_orchestrator_starts_an_agent_for_a_new_task(space, task_created):
-    out = react("orchestrator", task_created, space)
-    assert [e.event_type for e in out] == [s.AGENT_EXECUTE, s.TASK_STATE_CHANGED]
-    command, state = out
-    assert command.payload == {
-        "taskId": "task-0001",
-        "goal": "Summarise document 1",
-        "tool": "search",
-        "deadlineSeconds": 60,
+def test_every_principal_gets_its_own_username_and_acl_profile(space):
+    specs = {a.principal: a for a in s.access_specs(space)}
+    assert tuple(specs) == s.PRINCIPALS == ("api-gateway", *s.SERVICE_NAMES)
+    assert [a.username for a in specs.values()] == [f"cowork-{p}" for p in s.PRINCIPALS]
+    assert all(a.acl_profile == a.username for a in specs.values())
+    assert len({a.username for a in specs.values()}) == 6  # nothing shared, nothing `default`
+
+
+def test_client_profile_is_chosen_by_role(space):
+    profile = {a.principal: a.client_profile for a in s.access_specs(space)}
+    assert profile["api-gateway"] == "cowork-publish"  # publishes, has no queue
+    assert profile["orchestrator"] == "cowork-publish-consume"
+    assert profile["agent-runtime"] == "cowork-publish-consume"
+    assert profile["tool-execution"] == "cowork-publish-consume"
+    assert profile["streaming-gateway"] == "cowork-consume"  # sinks never publish
+    assert profile["audit-pipeline"] == "cowork-consume"
+    rights = {p.name: (p.guaranteed_send, p.guaranteed_receive) for p in s.CLIENT_PROFILES}
+    assert rights == {
+        "cowork-publish": (True, False),
+        "cowork-consume": (False, True),
+        "cowork-publish-consume": (True, True),
     }
-    assert state.payload == {"taskId": "task-0001", "state": "running"}
-    for e in out:
-        assert e.correlation_id == task_created.correlation_id
-        assert e.causation_id == task_created.event_id
-        assert e.producer.service == "orchestrator"
 
 
-def test_tool_execution_completes_a_normal_tool_and_fails_the_flaky_one(space, task_created):
-    agent = me("agent-runtime")
-    command = task_created.derive(s.TOOL_EXECUTE, agent, {"taskId": "t", "tool": "search"})
-    out = react("tool-execution", command, space)
-    assert [e.event_type for e in out] == [s.TOOL_ACCEPTED, s.TOOL_PROGRESSED, s.TOOL_COMPLETED]
-    assert out[2].payload["resultRef"] == "s3://cowork-results/acme/t.json"
-
-    flaky = task_created.derive(s.TOOL_EXECUTE, agent, {"taskId": "t", "tool": s.FLAKY_TOOL})
-    out = react("tool-execution", flaky, space)
-    assert [e.event_type for e in out] == [s.TOOL_ACCEPTED, s.TOOL_PROGRESSED, s.TOOL_FAILED]
-    assert "simulated" in out[2].payload["reason"]
-
-
-@pytest.mark.parametrize("name", ["streaming-gateway", "audit-pipeline"])
-def test_sinks_never_publish(space, task_created, name):
-    assert react(name, task_created, space) == []
-
-
-@pytest.mark.parametrize("name", ["orchestrator", "agent-runtime", "tool-execution"])
-def test_unexpected_event_types_produce_no_reaction(space, task_created, name):
-    stray = task_created.derive("cowork.platform.config.changed", me("platform"), {})
-    assert react(name, stray, space) == []
+def test_publish_rights_are_exactly_the_declared_event_topics(space):
+    topics = {a.principal: a.publish_topics for a in s.access_specs(space)}
+    assert topics["api-gateway"] == ("cowork/dev/apse1/orchestration/task/created/v1",)
+    assert topics["agent-runtime"] == (
+        "cowork/dev/apse1/agent/agent/started/v1",
+        "cowork/dev/apse1/tooling/command/execute/v1",
+        "cowork/dev/apse1/agent/agent/completed/v1",
+        "cowork/dev/apse1/agent/agent/failed/v1",
+    )
+    assert topics["streaming-gateway"] == () and topics["audit-pipeline"] == ()
+    # no wildcard ever reaches a publish right
+    assert not any("*" in t or ">" in t for ts in topics.values() for t in ts)
 
 
 def _run_flow(space: TopicSpace, root: Envelope) -> list[Envelope]:
@@ -115,6 +125,9 @@ def _run_flow(space: TopicSpace, root: Envelope) -> list[Envelope]:
         for name, svc in s.SERVICES.items():
             if any(matches(sub, topic) for sub in svc.subscriptions(space)):
                 for out in svc.react(env, parts, me(name)):
+                    # The broker's ACL would refuse anything else: a reaction that
+                    # emits an undeclared type must fail here, not in a running stack.
+                    assert out.event_type in svc.publishes, (name, out.event_type)
                     published.append(out)
                     queue.append(out)
     return published

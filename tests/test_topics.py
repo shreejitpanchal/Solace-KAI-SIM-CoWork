@@ -72,6 +72,12 @@ def test_queue_names_carry_environment_region_and_service(space):
     assert space.queue_name("q.cowork", "orchestrator") == "q.cowork.dev.apse1.orchestrator"
 
 
+def test_dmq_name_is_the_service_queue_name_plus_dmq(space):
+    assert space.dmq_name("q.cowork", "orchestrator") == "q.cowork.dev.apse1.orchestrator.dmq"
+    with pytest.raises(ValueError, match="service"):
+        space.dmq_name("q.cowork", "a/b")
+
+
 def test_parse_round_trips_events_and_commands(space):
     ev = space.parse("cowork/dev/apse1/orchestration/task/created/v1")
     assert ev == topics.TopicParts("dev", "apse1", "orchestration", "task", "created", "v1")

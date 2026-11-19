@@ -3,8 +3,8 @@
 Why a wrapper
 -------------
 The simulation services and their tests talk to `Broker`, `Inbound` and `Outbound`, not
-to the SDK. That keeps the application logic (services.py, consumer.py,
-publisher.py) free of broker details and unit-testable without a broker. The
+to the SDK. That keeps the application logic (the service packages under
+services/, consumer.py) free of broker details and unit-testable without a broker. The
 SDK, which ships a native library, is imported inside the methods that need
 it, so importing this module never requires a broker or the native library.
 
@@ -16,7 +16,12 @@ Guaranteed (persistent) messaging throughout:
   * subscribe() binds a persistent receiver to a durable exclusive queue that
     carries the topic subscription, so events are spooled while the consumer
     is down and delivered when it rebinds;
-  * each message is acknowledged after the handler returns.
+  * each message is acknowledged after the handler returns;
+  * a handler that raises settles the message FAILED instead: the broker
+    redelivers it, and after the queue's maxRedeliveryCount moves it to the
+    queue's dead message queue (provision.py sets both);
+  * every message is published DMQ-eligible, without which the broker would
+    discard an expired or undeliverable message instead of moving it.
 
 Message shape used by the flow
 ------------------------------
@@ -61,7 +66,24 @@ class Outbound:
 
 # A handler receives one Inbound per message. It should return normally
 # (the message is then acked) and never raise for a bad message: log and drop.
+# Raising means "I could not process this": the message is redelivered and
+# ends in the dead message queue if it keeps failing.
 Handler = Callable[[Inbound], None]
+
+
+def deliver(handler: Handler, inbound: Inbound, queue_name: str) -> bool:
+    """Run `handler` on one message. True = ack it; False = it raised, settle it FAILED."""
+    try:
+        handler(inbound)
+    except Exception:
+        log.exception(
+            "handler failed on %s from queue %s; settling FAILED so the broker redelivers it, "
+            "then moves it to the queue's dead message queue after maxRedeliveryCount",
+            inbound.topic,
+            queue_name,
+        )
+        return False
+    return True
 
 
 def to_inbound(message: Any) -> Inbound:
@@ -115,14 +137,18 @@ class Broker:
         """Persistent publish; returns once the broker has spooled the message.
 
         User properties are attached with with_property(); the envelope
-        itself travels in the payload, as given.
+        itself travels in the payload, as given. The message is marked
+        DMQ-eligible so a queue can move it to its dead message queue.
         """
+        from solace.messaging.config.solace_properties.message_properties import (
+            PERSISTENT_DMQ_ELIGIBLE,
+        )
         from solace.messaging.resources.topic import Topic
 
         if self._publisher is None:
             self._publisher = self._service.create_persistent_message_publisher_builder().build()
             self._publisher.start()
-        builder = self._service.message_builder()
+        builder = self._service.message_builder().from_properties({PERSISTENT_DMQ_ELIGIBLE: True})
         for key, value in msg.properties.items():
             builder = builder.with_property(key, value)
         log.debug(
@@ -139,14 +165,22 @@ class Broker:
     def subscribe(self, queue_name: str, subscriptions: list[str], handler: Handler) -> None:
         """Bind to a durable exclusive queue carrying `subscriptions`; deliver to `handler`.
 
-        With `create_queues` on (the default, SOLACE_CREATE_QUEUES=true) a
-        missing queue and its subscriptions are created on start, which needs
-        "allow guaranteed endpoint create" on the client profile (on in the
-        default profile). Off means the queue must be pre-provisioned by an
-        administrator, and a missing one fails loudly here.
+        With `create_queues` off (the default) this only binds: the queue and
+        its subscriptions must have been provisioned (provision.py), and a
+        missing queue fails loudly here. That is all a least-privilege client
+        may do; `subscriptions` is then used for the log line only.
+
+        With `create_queues` on (SOLACE_CREATE_QUEUES=true) a missing queue
+        is created and the subscriptions are added on start. That needs
+        "allow guaranteed endpoint create" on the client profile and
+        subscribe rights in the ACL profile, which the provisioned profiles
+        deliberately withhold; it is for a throwaway broker's `default` user.
 
         Delivery is asynchronous: the SDK calls the handler on its own thread.
+        A message whose handler raises is settled FAILED (see deliver()), which
+        needs a broker that supports negative acknowledgements (10.2.1 or later).
         """
+        from solace.messaging.config.message_acknowledgement_configuration import Outcome
         from solace.messaging.config.missing_resources_creation_configuration import (
             MissingResourcesCreationStrategy,
         )
@@ -159,30 +193,31 @@ class Broker:
             if self._cfg.create_queues
             else MissingResourcesCreationStrategy.DO_NOT_CREATE
         )
-        receiver = (
+        builder = (
             self._service.create_persistent_message_receiver_builder()
             .with_missing_resources_creation_strategy(strategy)
-            .with_subscriptions([TopicSubscription.of(s) for s in subscriptions])
-            .build(Queue.durable_exclusive_queue(queue_name))
+            .with_required_message_outcome_support(Outcome.FAILED)
         )
+        if self._cfg.create_queues:
+            builder = builder.with_subscriptions([TopicSubscription.of(s) for s in subscriptions])
+        receiver = builder.build(Queue.durable_exclusive_queue(queue_name))
 
         class _Adapter(MessageHandler):
-            """SDK callback -> our Handler, with ack handling."""
+            """SDK callback -> our Handler, with ack / failed-settlement handling."""
 
             def on_message(self, message: Any) -> None:
-                # Handlers drop bad events deliberately and return normally. An
-                # exception here is a bug, not a transient fault, so the message
-                # is still acked: redelivering a poison message forever helps
-                # nobody in a simulation. Swap for settle(FAILED) if redelivery is wanted.
+                # Handlers drop bad events deliberately and return normally, so
+                # those are acked. An exception is a failure to process: the
+                # message stays on the queue and is redelivered, and the queue's
+                # maxRedeliveryCount sends a poison message to the DMQ instead
+                # of letting it loop forever.
                 inbound = to_inbound(message)
                 log.debug("queue %s delivered a message on %s", queue_name, inbound.topic)
-                try:
-                    handler(inbound)
-                except Exception:
-                    log.exception("handler failed; message dropped")
-                finally:
+                if deliver(handler, inbound, queue_name):
                     receiver.ack(message)
                     log.debug("acked message on %s from queue %s", inbound.topic, queue_name)
+                else:
+                    receiver.settle(message, Outcome.FAILED)
 
         receiver.start()
         receiver.receive_async(_Adapter())

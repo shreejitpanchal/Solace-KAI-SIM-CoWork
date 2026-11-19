@@ -1,12 +1,20 @@
-# Whole simulation in containers: provision (one-shot: queues with a 24 h
-# message TTL over SEMP), publisher (one task every PUBLISH_INTERVAL_SECONDS),
-# the five consuming services, and optionally the broker itself.
+# Whole simulation in containers: provision (one-shot: access control, queues
+# with a 24 h message TTL and their DMQs, over SEMP), publisher (one task every
+# PUBLISH_INTERVAL_SECONDS), the five consuming services, and optionally the
+# broker itself.
+#
+# Access control: every service connects as its own client username
+# (cowork-<service>, fixed by the registry in src/kai_sim_cowork/services/) and is handed only
+# its own password, as SOLACE_PASSWORD, from SOLACE_PASSWORD_<SERVICE> in .env.
+# Only the provisioner sees all six, to create the usernames. .env must set
+# them; there is no default, so a missing one stops compose with its name.
 #
 # Broker, two modes, chosen in .env:
 #   local     COMPOSE_PROFILES=local-broker (the default in .env.example): the
 #             `solace` service runs here and the apps reach it as tcp://solace:55555.
-#   external  COMPOSE_PROFILES= (empty) and SOLACE_HOST/VPN/USERNAME/PASSWORD
-#             set to the external broker. Nothing broker-related starts here.
+#   external  COMPOSE_PROFILES= (empty) and SOLACE_HOST/VPN plus SEMP_URL and
+#             an admin in SEMP_USERNAME/PASSWORD for the external broker.
+#             Nothing broker-related starts here.
 #             For a broker on this machine, use tcp://host.docker.internal:55555.
 #
 #   docker compose up -d --build             everything (+ broker in local mode)
@@ -20,14 +28,13 @@
 # Broker.connect retries for up to three minutes instead, which also covers
 # the local container's 1-2 minute boot.
 
-# Shared environment; the provision service extends it with SEMP settings.
+# Shared environment, with no credentials in it: each service adds its own
+# SOLACE_PASSWORD and the provision service adds the SEMP settings.
 x-env: &env
   SOLACE_HOST: ${SOLACE_HOST:-tcp://solace:55555}
   SOLACE_VPN: ${SOLACE_VPN:-default}
-  SOLACE_USERNAME: ${SOLACE_USERNAME:-default}
-  SOLACE_PASSWORD: ${SOLACE_PASSWORD:-default}
   SOLACE_QUEUE_PREFIX: ${SOLACE_QUEUE_PREFIX:-q.cowork}
-  SOLACE_CREATE_QUEUES: ${SOLACE_CREATE_QUEUES:-true}
+  SOLACE_CREATE_QUEUES: ${SOLACE_CREATE_QUEUES:-false}
   COWORK_ENVIRONMENT: ${COWORK_ENVIRONMENT:-dev}
   COWORK_REGION: ${COWORK_REGION:-apse1}
   COWORK_TENANT_ID: ${COWORK_TENANT_ID:-acme}
@@ -44,27 +51,25 @@ x-app: &app
   extra_hosts:
     - "host.docker.internal:host-gateway" # lets Linux hosts reach a broker on the host machine
 
-# One consuming service. Each service below sets only its --service; the
-# consumer binds <prefix>.<env>.<region>.<service> with the subscriptions
-# declared for it in services.py.
+# One consuming service. Each service below runs its own entry point
+# (kai-sim-<service>, the main.py of its package under src/kai_sim_cowork/services/)
+# and binds <prefix>.<env>.<region>.<service>, whose subscriptions its package declares.
 x-consumer: &consumer
   <<: *app
-  entrypoint: ["kai-sim-consumer"]
   depends_on:
     provision: { condition: service_completed_successfully }
   restart: on-failure
 
 services:
-  # Local broker; only with the local-broker profile. PubSub+ Enterprise
-  # single node; the image must already be loaded locally (docker image ls
-  # solace-pubsub-enterprise). Spool state lives in the named volume below
-  # and survives `down`; `down -v` wipes it.
+  # Local broker; only with the local-broker profile. PubSub+ Standard
+  # single node, pulled from Docker Hub on first `up`. Spool state lives in
+  # the named volume below and survives `down`; `down -v` wipes it.
   solace:
-    image: ${SOLACE_IMAGE:-solace-pubsub-enterprise:10.25.0.246}
-    container_name: solace-ent
+    image: ${SOLACE_IMAGE:-solace/solace-pubsub-standard:10.26.0.9219}
+    container_name: solace-std
     profiles: ["local-broker"]
     volumes:
-      - "solace-ent-storage-group:/var/lib/solace"
+      - "solace-std-storage-group:/var/lib/solace"
     shm_size: 1g
     ulimits:
       core: -1
@@ -108,11 +113,14 @@ services:
       retries: 30
       start_period: 90s
 
-  # One-shot: creates every service queue over SEMP v2 with its subscriptions
-  # and a 24-hour message TTL (QUEUE_MAX_TTL_SECONDS), then exits 0. The
-  # publisher and every consumer wait for it, so no task is published before
-  # its queues exist. It retries SEMP for PROVISION_TIMEOUT_SECONDS to cover
-  # the broker's boot.
+  # One-shot: over SEMP v2 it creates the client profiles, one ACL profile and
+  # client username per service, then every service queue with its owner,
+  # subscriptions, a 24-hour message TTL (QUEUE_MAX_TTL_SECONDS), a redelivery
+  # limit (QUEUE_MAX_REDELIVERY_COUNT) and its dead message queue, then exits
+  # 0. The publisher and every consumer wait for it, so nothing connects
+  # before its username and queue exist. It retries SEMP for
+  # PROVISION_TIMEOUT_SECONDS to cover the broker's boot. It is the only
+  # container that holds the SEMP admin password and all six service passwords.
   provision:
     <<: *app
     container_name: kai-sim-provision
@@ -123,43 +131,70 @@ services:
       SEMP_USERNAME: ${SEMP_USERNAME:-admin}
       SEMP_PASSWORD: ${SEMP_PASSWORD:-${SOLACE_ADMIN_PASSWORD:-admin}}
       QUEUE_MAX_TTL_SECONDS: ${QUEUE_MAX_TTL_SECONDS:-86400}
+      QUEUE_MAX_REDELIVERY_COUNT: ${QUEUE_MAX_REDELIVERY_COUNT:-3}
       PROVISION_TIMEOUT_SECONDS: ${PROVISION_TIMEOUT_SECONDS:-180}
+      SOLACE_PASSWORD_API_GATEWAY: ${SOLACE_PASSWORD_API_GATEWAY:?set it in .env (see .env.example)}
+      SOLACE_PASSWORD_ORCHESTRATOR: ${SOLACE_PASSWORD_ORCHESTRATOR:?set it in .env (see .env.example)}
+      SOLACE_PASSWORD_AGENT_RUNTIME: ${SOLACE_PASSWORD_AGENT_RUNTIME:?set it in .env (see .env.example)}
+      SOLACE_PASSWORD_TOOL_EXECUTION: ${SOLACE_PASSWORD_TOOL_EXECUTION:?set it in .env (see .env.example)}
+      SOLACE_PASSWORD_STREAMING_GATEWAY: ${SOLACE_PASSWORD_STREAMING_GATEWAY:?set it in .env (see .env.example)}
+      SOLACE_PASSWORD_AUDIT_PIPELINE: ${SOLACE_PASSWORD_AUDIT_PIPELINE:?set it in .env (see .env.example)}
 
   # Simulated API gateway: one task.created every PUBLISH_INTERVAL_SECONDS.
   # PUBLISH_COUNT > 0 publishes that many and exits (useful with `compose run`).
+  # Connects as cowork-api-gateway: may publish task.created, owns no queue.
   publisher:
     <<: *app
     container_name: kai-sim-publisher
     entrypoint: ["kai-sim-publisher"]
+    environment:
+      <<: *env
+      SOLACE_PASSWORD: ${SOLACE_PASSWORD_API_GATEWAY:?set it in .env (see .env.example)}
     depends_on:
       provision: { condition: service_completed_successfully }
     restart: on-failure
 
-  # The five consuming services, one container and one queue each.
+  # The five consuming services: one container, one client username
+  # (cowork-<service>) and one queue each.
   orchestrator:
     <<: *consumer
     container_name: kai-sim-orchestrator
-    command: ["--service", "orchestrator"]
+    entrypoint: ["kai-sim-orchestrator"]
+    environment:
+      <<: *env
+      SOLACE_PASSWORD: ${SOLACE_PASSWORD_ORCHESTRATOR:?set it in .env (see .env.example)}
 
   agent-runtime:
     <<: *consumer
     container_name: kai-sim-agent-runtime
-    command: ["--service", "agent-runtime"]
+    entrypoint: ["kai-sim-agent-runtime"]
+    environment:
+      <<: *env
+      SOLACE_PASSWORD: ${SOLACE_PASSWORD_AGENT_RUNTIME:?set it in .env (see .env.example)}
 
   tool-execution:
     <<: *consumer
     container_name: kai-sim-tool-execution
-    command: ["--service", "tool-execution"]
+    entrypoint: ["kai-sim-tool-execution"]
+    environment:
+      <<: *env
+      SOLACE_PASSWORD: ${SOLACE_PASSWORD_TOOL_EXECUTION:?set it in .env (see .env.example)}
 
   streaming-gateway:
     <<: *consumer
     container_name: kai-sim-streaming-gateway
-    command: ["--service", "streaming-gateway"]
+    entrypoint: ["kai-sim-streaming-gateway"]
+    environment:
+      <<: *env
+      SOLACE_PASSWORD: ${SOLACE_PASSWORD_STREAMING_GATEWAY:?set it in .env (see .env.example)}
 
   audit-pipeline:
     <<: *consumer
     container_name: kai-sim-audit-pipeline
-    command: ["--service", "audit-pipeline"]
+    entrypoint: ["kai-sim-audit-pipeline"]
+    environment:
+      <<: *env
+      SOLACE_PASSWORD: ${SOLACE_PASSWORD_AUDIT_PIPELINE:?set it in .env (see .env.example)}
 
 volumes:
-  solace-ent-storage-group:
+  solace-std-storage-group:

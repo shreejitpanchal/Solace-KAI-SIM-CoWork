@@ -9,8 +9,9 @@ routing; no service ever addresses another.
 The simulation follows the *Cowork-Solace Architecture* brief (external
 consultant edition): its topic convention (section 4), message envelope
 (section 5), one-queue-per-consumer rule (section 7) and the example task
-flow (section 13). Everything else in the brief (identity integration, TLS,
-outbox, DMQ, DR) is deliberately out of scope here.
+flow (section 13), plus a dead message queue per consumer queue. Everything
+else in the brief (identity integration, TLS, outbox, DR) is deliberately out
+of scope here.
 
 ---
 
@@ -24,13 +25,26 @@ outbox, DMQ, DR) is deliberately out of scope here.
 | `tool-execution` | Tool execution service | Runs the tool: accepted, progressed, completed or failed. |
 | `streaming-gateway` | Notification / streaming gateway | Receives task lifecycle and progress events to push to the user. |
 | `audit-pipeline` | Audit and analytics pipeline | Receives a copy of everything. |
-| `provision` | Infrastructure as code | Creates the five queues and their subscriptions over SEMP v2, with a 24 h message TTL. |
+| `provision` | Infrastructure as code | Over SEMP v2: creates a client username and ACL profile per service and three role-based client profiles, then the five queues with their owner, subscriptions, a 24 h message TTL, a redelivery limit and a dead message queue each. |
 
-Each consumer is the same program, `kai-sim-consumer --service <name>`; the
-registry in `src/kai_sim_cowork/services.py` says what each one subscribes
-to and how it reacts. A reaction is a pure function from an inbound envelope
-to the envelopes to publish next, so the whole flow is unit-tested without a
-broker.
+Each service is its own code component, a package under
+`src/kai_sim_cowork/services/` with the same three files, and its own entry
+point (`kai-sim-orchestrator`, `kai-sim-agent-runtime`, ...):
+
+```
+services/orchestrator/
+  __init__.py    the declaration: name, queue subscriptions, what it may publish
+  handlers.py    the business logic: one pure function per inbound event type
+  main.py        the entry point: run(SERVICE)
+```
+
+The declaration is what the broker objects are derived from (queue, dead
+message queue, client username, ACL profile). A handler is a pure function
+from an inbound envelope to the envelopes to publish next, so the whole flow
+is unit-tested without a broker. Connecting, validating, publishing and
+acknowledging are the same for every service and live once, in
+`consumer.py`. `docs/DEVELOPER.md` section 2 walks through the structure as
+a reference for building real services.
 
 ```
  publisher ──task/created──►  ┌──────────────────── Solace PubSub+ ────────────────────┐
@@ -87,6 +101,9 @@ capability + command (`agent/command/execute`).
 The topic is routing metadata only. Identifiers, tenant, correlation and the
 small domain payload travel in the envelope (section 4 below).
 
+The full design, with the level-by-level rules and the routing matrix for all
+thirteen topics, is in [docs/TOPIC-TAXONOMY.md](docs/TOPIC-TAXONOMY.md).
+
 ---
 
 ## 3. Queues and their topic subscriptions
@@ -107,6 +124,62 @@ the broker:
 Every queue is created with `respectTtlEnabled` on and `maxTtl` =
 `QUEUE_MAX_TTL_SECONDS` (default 86400), so a message nobody consumes within
 24 hours is expired by the broker.
+
+### Access control
+
+No service uses the broker's built-in `default` client username, client
+profile or ACL profile. Every service has its own identity with the least it
+needs, created by the `provision` service from the same registry that
+declares the subscriptions:
+
+| Service | Client username and ACL profile | Client profile | May publish | Queue it owns |
+|---|---|---|---|---|
+| publisher | `cowork-api-gateway` | `cowork-publish` | `…/orchestration/task/created/v1` | none |
+| orchestrator | `cowork-orchestrator` | `cowork-publish-consume` | `…/agent/command/execute/v1`, `…/orchestration/task/state-changed/v1`, `…/task/completed/v1`, `…/task/failed/v1` | `q…orchestrator` |
+| agent-runtime | `cowork-agent-runtime` | `cowork-publish-consume` | `…/agent/agent/started/v1`, `…/agent/agent/completed/v1`, `…/agent/agent/failed/v1`, `…/tooling/command/execute/v1` | `q…agent-runtime` |
+| tool-execution | `cowork-tool-execution` | `cowork-publish-consume` | `…/tooling/tool/accepted/v1`, `…/progressed/v1`, `…/completed/v1`, `…/failed/v1` | `q…tool-execution` |
+| streaming-gateway | `cowork-streaming-gateway` | `cowork-consume` | nothing | `q…streaming-gateway` |
+| audit-pipeline | `cowork-audit-pipeline` | `cowork-consume` | nothing | `q…audit-pipeline` |
+
+How the three layers divide the work:
+
+- **Client username**: who is connecting. One per service, each with its own
+  password (`SOLACE_PASSWORD_<SERVICE>`); a container is handed only its own.
+- **ACL profile**: which topics. One per service. Publish and subscribe are
+  disallowed by default; the only exceptions are publish exceptions for the
+  exact topics in the table. There are no subscribe exceptions at all:
+  services receive only through their queue.
+- **Client profile**: what kind of client. Three, shared by role.
+  `cowork-publish` may send guaranteed messages, `cowork-consume` may receive
+  them, `cowork-publish-consume` both. None may create queues, use transacted
+  sessions or connect as a bridge, and each username is limited to five
+  connections.
+- **Queue**: owned by its service's username, with no access for anyone
+  else. Only the provisioner sets subscriptions; a consumer just binds.
+
+So a service that is compromised or simply wrong cannot read another
+service's queue, subscribe to anything, or publish another service's events.
+A publish to a topic outside its list is refused by the broker; the consumer
+logs the failure and the inbound message is redelivered and then
+dead-lettered (next section).
+
+### Dead message queues
+
+An expired message is not thrown away. Every queue above has its own dead
+message queue (DMQ), named `<queue>.dmq`, for example
+`q.cowork.dev.apse1.orchestrator.dmq`. A DMQ has no topic subscriptions and
+no expiry; only the broker puts messages into it, in two cases:
+
+| Trigger | Queue setting | What happens |
+|---|---|---|
+| The message was not consumed in time | `maxTtl` = `QUEUE_MAX_TTL_SECONDS` | The broker moves it from the queue to the queue's DMQ. |
+| The consumer keeps failing on it | `maxRedeliveryCount` = `QUEUE_MAX_REDELIVERY_COUNT` (default 3) | A handler that raises (for example a reaction that could not be published) settles the message as failed. The broker redelivers it, and after 3 redeliveries moves it to the DMQ so it cannot loop forever. |
+
+Every message is published with the DMQ-eligible flag; without it the broker
+would discard the message in both cases. Contract violations (section 4) are
+still logged and dropped, not dead-lettered. Nothing consumes the DMQs: look
+at them in PubSub+ Manager, where a non-zero *Messages Queued* on a `.dmq`
+queue means something needs attention.
 
 ### How a queue's topic subscription drives delivery
 
@@ -180,12 +253,14 @@ they are usable in broker-side selectors.
 
 ## 5. Run it with Docker
 
-Prerequisites: Docker with the compose plugin, uv, and the PubSub+ Enterprise
-image loaded locally (`docker image ls solace-pubsub-enterprise`).
+Prerequisites: Docker with the compose plugin, and uv. The broker is the
+PubSub+ Standard image (`solace/solace-pubsub-standard`), pulled from Docker
+Hub on the first `up`.
 
 ```sh
 uv lock                       # writes uv.lock; commit it
 cp .env.example .env          # local broker by default; see the file for an external one
+                              # then replace the six SOLACE_PASSWORD_<SERVICE> placeholders
 docker compose up -d --build  # broker, provision, publisher, five consumers
 docker compose ps             # wait until solace shows (healthy): 1-2 minutes
 ```
@@ -210,7 +285,10 @@ every line of one task):
 
 Every fifth task ends in `task.failed` instead. PubSub+ Manager
 (http://localhost:8080, admin / `SOLACE_ADMIN_PASSWORD`) → Queues shows the
-five queues, their subscriptions and the TTL settings.
+five queues with their owner, subscriptions and TTL settings, and the five
+`.dmq` queues next to them. Access Control shows the six `cowork-…` client
+usernames, their ACL profiles and the three client profiles; Clients shows
+each service connected under its own username.
 
 Things to try:
 
@@ -221,9 +299,16 @@ PUBLISH_COUNT=3 docker compose run --rm publisher   # a burst of three tasks alo
 docker compose down                       # stop everything; add -v to drop the broker's data
 ```
 
+To see a dead message queue fill, set `QUEUE_MAX_TTL_SECONDS=30` in `.env`,
+run `docker compose up -d` (the provisioner updates the queues), then
+`docker compose stop streaming-gateway`. After 30 seconds its messages start
+moving from `q.cowork.dev.apse1.streaming-gateway` to
+`q.cowork.dev.apse1.streaming-gateway.dmq` in PubSub+ Manager.
+
 To use a broker that is already running, set `COMPOSE_PROFILES=` (empty),
-`SOLACE_HOST`, `SOLACE_VPN`, `SOLACE_USERNAME`, `SOLACE_PASSWORD` and
-`SEMP_URL` / `SEMP_USERNAME` / `SEMP_PASSWORD` in `.env`.
+`SOLACE_HOST`, `SOLACE_VPN` and `SEMP_URL` / `SEMP_USERNAME` /
+`SEMP_PASSWORD` (an admin of that message VPN) in `.env`. The provisioner
+creates the same client usernames, profiles and queues there.
 
 ---
 
@@ -231,14 +316,19 @@ To use a broker that is already running, set `COMPOSE_PROFILES=` (empty),
 
 ```sh
 docker compose up -d solace                         # broker only
-uv run kai-sim-provision                            # once: the five queues with a 24 h TTL (SEMP on :8080)
-uv run kai-sim-consumer --service orchestrator      # one terminal per service
-uv run kai-sim-consumer --service agent-runtime
-uv run kai-sim-consumer --service tool-execution
-uv run kai-sim-consumer --service streaming-gateway
-uv run kai-sim-consumer --service audit-pipeline
-uv run kai-sim-publisher --count 3 --interval 1     # three tasks, then exit
+uv run --env-file .env kai-sim-provision                        # once: access control, queues, DMQs (SEMP on :8080)
+uv run --env-file .env kai-sim-orchestrator                     # one terminal per service
+uv run --env-file .env kai-sim-agent-runtime
+uv run --env-file .env kai-sim-tool-execution
+uv run --env-file .env kai-sim-streaming-gateway
+uv run --env-file .env kai-sim-audit-pipeline
+uv run --env-file .env kai-sim-publisher --count 3 --interval 1 # three tasks, then exit
 ```
+
+`--env-file .env` supplies the service passwords; each command picks the one
+for the service it starts and connects as `cowork-<service>`.
+`kai-sim-consumer --service <name>` starts any consuming service by name and
+is equivalent to its own entry point.
 
 ---
 
@@ -248,15 +338,17 @@ uv run kai-sim-publisher --count 3 --interval 1     # three tasks, then exit
 |---|---|---|
 | `SOLACE_HOST` | `tcp://localhost:55555` | Broker SMF address (`tcp://solace:55555` inside compose) |
 | `SOLACE_VPN` | `default` | Message VPN |
-| `SOLACE_USERNAME` / `SOLACE_PASSWORD` | `default` / `default` | Client username and password |
+| `SOLACE_PASSWORD_<SERVICE>` | none, required | Password of the client username `cowork-<service>`, one each for `API_GATEWAY`, `ORCHESTRATOR`, `AGENT_RUNTIME`, `TOOL_EXECUTION`, `STREAMING_GATEWAY`, `AUDIT_PIPELINE`. The provisioner sets them on the broker; each service reads its own |
+| `SOLACE_PASSWORD` | unset | Overrides the per-service variable for one process; compose uses it to hand each container only its own password |
 | `SOLACE_QUEUE_PREFIX` | `q.cowork` | Prefix of the service queues |
-| `SOLACE_CREATE_QUEUES` | `true` | Let a consumer create a missing queue on bind (no TTL); `false` requires provisioned queues |
+| `SOLACE_CREATE_QUEUES` | `false` | `false`: consumers only bind to provisioned queues. `true` lets a consumer create a missing queue and add subscriptions on bind, which the provisioned profiles forbid |
 | `COWORK_ENVIRONMENT` | `dev` | Second topic level and part of every queue name |
 | `COWORK_REGION` | `apse1` | Third topic level and part of every queue name |
 | `COWORK_TENANT_ID` | `acme` | `tenantId` the publisher stamps on every task |
 | `PUBLISH_INTERVAL_SECONDS` | `5` | Seconds between tasks (decimal allowed) |
 | `PUBLISH_COUNT` | `0` | Tasks to publish before exiting; `0` runs until stopped |
-| `QUEUE_MAX_TTL_SECONDS` | `86400` | Message expiry `kai-sim-provision` sets on every queue |
+| `QUEUE_MAX_TTL_SECONDS` | `86400` | Message expiry `kai-sim-provision` sets on every queue; expired messages go to the queue's DMQ |
+| `QUEUE_MAX_REDELIVERY_COUNT` | `3` | Redeliveries of a failed message before it goes to the queue's DMQ (0 to 255; `0` redelivers forever) |
 | `SEMP_URL` | `http://localhost:8080` | Broker management (SEMP v2) URL (`http://solace:8080` inside compose) |
 | `SEMP_USERNAME` / `SEMP_PASSWORD` | `admin` / `admin` | SEMP credentials (compose defaults the password to `SOLACE_ADMIN_PASSWORD`) |
 | `PROVISION_TIMEOUT_SECONDS` | `180` | How long `kai-sim-provision` waits for SEMP while the broker boots |
@@ -274,5 +366,5 @@ build, lint, test and scan; CI calls the same task names.
 ./scripts/dev.sh scan         # vuln + image + trivy
 ```
 
-See `docs/DEVELOPER.md` for the module map and how to add a service or an
-event.
+See `docs/DEVELOPER.md` for how a service component is structured, the
+module map and how to add a service, a handler or an event.

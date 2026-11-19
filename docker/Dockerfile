@@ -34,5 +34,5 @@ COPY --from=build /app/src /app/src
 ENV PATH=/app/.venv/bin:$PATH \
     PYTHONUNBUFFERED=1
 USER app
-ENTRYPOINT ["kai-sim-consumer"]
-CMD ["--service", "audit-pipeline"]
+# compose overrides this per service (kai-sim-orchestrator, kai-sim-publisher, ...).
+ENTRYPOINT ["kai-sim-audit-pipeline"]

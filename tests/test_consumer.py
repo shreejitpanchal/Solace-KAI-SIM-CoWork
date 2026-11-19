@@ -69,13 +69,24 @@ def test_envelope_whose_type_disagrees_with_the_topic_is_dropped(space, task_cre
     assert "does not match the topic" in caplog.text
 
 
+def test_a_failed_publish_propagates_so_the_message_is_redelivered(space, task_created):
+    """The handler must not swallow it: broker.deliver turns the raise into a FAILED settlement."""
+
+    def publish(msg):
+        raise TimeoutError("broker did not acknowledge")
+
+    handle = consumer.make_handler(SERVICES["orchestrator"], space, ME, publish)
+    with pytest.raises(TimeoutError, match="did not acknowledge"):
+        handle(inbound(space, task_created))
+
+
 @pytest.fixture
 def fake_broker(monkeypatch):
     calls = []
 
     class FakeBroker:
         def __init__(self, cfg):
-            pass
+            calls.append(("connect-as", cfg.username, cfg.password))
 
         def connect(self):
             return self
@@ -96,17 +107,31 @@ def fake_broker(monkeypatch):
     monkeypatch.setenv("SOLACE_QUEUE_PREFIX", "q.test")
     monkeypatch.setenv("COWORK_ENVIRONMENT", "dev")
     monkeypatch.setenv("COWORK_REGION", "apse1")
+    monkeypatch.delenv("SOLACE_PASSWORD", raising=False)
+    for name in SERVICE_NAMES:
+        variable = "SOLACE_PASSWORD_" + name.upper().replace("-", "_")
+        monkeypatch.setenv(variable, f"pw-{name}")
     return calls
 
 
 @pytest.mark.parametrize("name", SERVICE_NAMES)
-def test_each_service_binds_its_own_queue_with_its_subscriptions(fake_broker, space, name):
+def test_each_service_binds_its_own_queue_as_its_own_client_username(fake_broker, space, name):
     assert consumer.main(["--service", name, "--instance", "i-1"]) == 0
     assert fake_broker == [
+        ("connect-as", f"cowork-{name}", f"pw-{name}"),
         ("subscribe", f"q.test.dev.apse1.{name}", SERVICES[name].subscriptions(space)),
         ("wait",),
         ("close",),
     ]
+
+
+def test_missing_password_returns_2_before_connecting(fake_broker, monkeypatch, caplog):
+    monkeypatch.delenv("SOLACE_PASSWORD_ORCHESTRATOR")
+    with caplog.at_level(logging.ERROR):
+        assert consumer.main(["--service", "orchestrator"]) == 2
+    assert "SOLACE_PASSWORD_ORCHESTRATOR" in caplog.text
+    assert "cowork-orchestrator" in caplog.text
+    assert fake_broker == []
 
 
 @pytest.mark.parametrize(

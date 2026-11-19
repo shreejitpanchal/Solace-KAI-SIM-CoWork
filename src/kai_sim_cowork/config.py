@@ -22,7 +22,10 @@ class BrokerConfig:
     username: str
     password: str
     queue_prefix: str  # consumer queues are named <prefix>.<environment>.<region>.<service>
-    create_queues: bool  # create missing queues on start, or require pre-provisioned ones
+    # False (default): bind to the provisioned queue and touch nothing else.
+    # True: create a missing queue and add its subscriptions on bind, which a
+    # least-privilege client profile and ACL profile do not allow.
+    create_queues: bool
 
     def masked(self) -> dict[str, str]:
         """Safe to log: the password is never echoed."""
@@ -52,16 +55,81 @@ def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
     raise ConfigError(f"{name} must be true or false, got {raw!r}")
 
 
-def broker_config(env: Mapping[str, str] | None = None) -> BrokerConfig:
-    """Defaults match the broker container in docker-compose.yml."""
+# The broker's limit for a client username's password.
+MAX_PASSWORD_LENGTH = 128
+
+
+def password_variable(principal: str) -> str:
+    """The variable holding a principal's password: api-gateway -> SOLACE_PASSWORD_API_GATEWAY."""
+    return "SOLACE_PASSWORD_" + principal.upper().replace("-", "_")
+
+
+def _check_password(value: str, variable: str) -> str:
+    if not value or len(value) > MAX_PASSWORD_LENGTH:
+        raise ConfigError(
+            f"{variable} must be set to a password of 1-{MAX_PASSWORD_LENGTH} characters "
+            "(see .env.example)"
+        )
+    return value
+
+
+def client_passwords(
+    principals: tuple[str, ...], env: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Every principal's password, for the provisioner that creates their client usernames.
+
+    Fails naming every missing variable at once, before any broker call.
+    """
     env = os.environ if env is None else env
+    missing = [password_variable(p) for p in principals if not env.get(password_variable(p))]
+    if missing:
+        raise ConfigError(
+            f"set {', '.join(missing)}: each service connects as its own client username "
+            "and needs its own password (see .env.example)"
+        )
+    return {
+        p: _check_password(env[password_variable(p)], password_variable(p)) for p in principals
+    }
+
+
+def broker_config(
+    env: Mapping[str, str] | None = None,
+    *,
+    principal: str | None = None,
+    username: str | None = None,
+) -> BrokerConfig:
+    """Connection settings; defaults match the broker container in docker-compose.yml.
+
+    A service passes its `principal` and the `username` the registry derives
+    for it (services.client_username): it then connects as that dedicated
+    client username, with the password from SOLACE_PASSWORD (what compose
+    hands each container) or else SOLACE_PASSWORD_<PRINCIPAL> (a host run
+    with the whole .env). Without a principal the broker's built-in `default`
+    username is used; only the provisioner (which never opens a messaging
+    connection) and the opt-in integration tests do that.
+    """
+    env = os.environ if env is None else env
+    if principal is None:
+        user = env.get("SOLACE_USERNAME", "default")
+        password = env.get("SOLACE_PASSWORD", "default")
+    else:
+        if not username:
+            raise ConfigError(f"no client username given for principal {principal!r}")
+        user = username
+        variable = "SOLACE_PASSWORD" if env.get("SOLACE_PASSWORD") else password_variable(principal)
+        if not env.get(variable):
+            raise ConfigError(
+                f"no password for client username {user!r}: set {password_variable(principal)} "
+                "(or SOLACE_PASSWORD for this process alone); see .env.example"
+            )
+        password = _check_password(env[variable], variable)
     return BrokerConfig(
         host=env.get("SOLACE_HOST", "tcp://localhost:55555"),
         vpn=env.get("SOLACE_VPN", "default"),
-        username=env.get("SOLACE_USERNAME", "default"),
-        password=env.get("SOLACE_PASSWORD", "default"),
+        username=user,
+        password=password,
         queue_prefix=env.get("SOLACE_QUEUE_PREFIX", "q.cowork"),
-        create_queues=_env_bool(env, "SOLACE_CREATE_QUEUES", True),
+        create_queues=_env_bool(env, "SOLACE_CREATE_QUEUES", False),
     )
 
 
@@ -140,6 +208,7 @@ class SempConfig:
     username: str
     password: str
     max_ttl_seconds: int  # message expiry applied to every queue (0 = no limit)
+    max_redelivery_count: int  # redeliveries before a message goes to the DMQ (0 = forever)
     timeout_seconds: float  # how long to wait for SEMP to answer while the broker boots
 
     def masked(self) -> dict[str, str]:
@@ -149,13 +218,18 @@ class SempConfig:
             "username": self.username,
             "password": "***",
             "max_ttl_seconds": str(self.max_ttl_seconds),
+            "max_redelivery_count": str(self.max_redelivery_count),
             "timeout_seconds": str(self.timeout_seconds),
         }
 
 
+# The broker's own limit for a queue's maxRedeliveryCount.
+MAX_REDELIVERY_LIMIT = 255
+
+
 def semp_config(env: Mapping[str, str] | None = None) -> SempConfig:
-    """SEMP_URL / SEMP_USERNAME / SEMP_PASSWORD, QUEUE_MAX_TTL_SECONDS (default 86400 = 24 h)
-    and PROVISION_TIMEOUT_SECONDS (default 180)."""
+    """SEMP_URL / SEMP_USERNAME / SEMP_PASSWORD, QUEUE_MAX_TTL_SECONDS (default 86400 = 24 h),
+    QUEUE_MAX_REDELIVERY_COUNT (default 3) and PROVISION_TIMEOUT_SECONDS (default 180)."""
     env = os.environ if env is None else env
     raw_ttl = env.get("QUEUE_MAX_TTL_SECONDS", "86400")
     try:
@@ -167,6 +241,19 @@ def semp_config(env: Mapping[str, str] | None = None) -> SempConfig:
         ) from exc
     if ttl < 0:
         raise ConfigError(f"QUEUE_MAX_TTL_SECONDS must not be negative, got {ttl}")
+    raw_redelivery = env.get("QUEUE_MAX_REDELIVERY_COUNT", "3")
+    try:
+        redelivery = int(raw_redelivery)
+    except ValueError as exc:
+        raise ConfigError(
+            f"QUEUE_MAX_REDELIVERY_COUNT must be an integer, got {raw_redelivery!r}; "
+            "unset it for the default of 3"
+        ) from exc
+    if not 0 <= redelivery <= MAX_REDELIVERY_LIMIT:
+        raise ConfigError(
+            f"QUEUE_MAX_REDELIVERY_COUNT must be between 0 (redeliver forever) and "
+            f"{MAX_REDELIVERY_LIMIT}, got {redelivery}"
+        )
     raw_timeout = env.get("PROVISION_TIMEOUT_SECONDS", "180")
     try:
         timeout = float(raw_timeout)
@@ -182,6 +269,7 @@ def semp_config(env: Mapping[str, str] | None = None) -> SempConfig:
         username=env.get("SEMP_USERNAME", "admin"),
         password=env.get("SEMP_PASSWORD", "admin"),
         max_ttl_seconds=ttl,
+        max_redelivery_count=redelivery,
         timeout_seconds=timeout,
     )
 

@@ -9,9 +9,15 @@ dependencies = [
   "httpx>=0.28",
 ]
 
-# One console script per box in the simulation.
+# One console script per box in the simulation: each service component's own
+# main.py, the provisioner, and the generic consumer launcher (--service).
 [project.scripts]
-kai-sim-publisher = "kai_sim_cowork.publisher:main"
+kai-sim-publisher = "kai_sim_cowork.services.api_gateway.main:main"
+kai-sim-orchestrator = "kai_sim_cowork.services.orchestrator.main:main"
+kai-sim-agent-runtime = "kai_sim_cowork.services.agent_runtime.main:main"
+kai-sim-tool-execution = "kai_sim_cowork.services.tool_execution.main:main"
+kai-sim-streaming-gateway = "kai_sim_cowork.services.streaming_gateway.main:main"
+kai-sim-audit-pipeline = "kai_sim_cowork.services.audit_pipeline.main:main"
 kai-sim-consumer = "kai_sim_cowork.consumer:main"
 kai-sim-provision = "kai_sim_cowork.provision:main"
 
