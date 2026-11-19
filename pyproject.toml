@@ -1,0 +1,53 @@
+[project]
+name = "kai-sim-cowork"
+version = "0.1.0"
+description = "Solace-KAI-SIM-CoWork: simulation of the Cowork event backbone on Solace PubSub+ (events via topics, consumers via queues with topic subscriptions)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "solace-pubsubplus>=1.9",
+  "httpx>=0.28",
+]
+
+# One console script per box in the simulation.
+[project.scripts]
+kai-sim-publisher = "kai_sim_cowork.publisher:main"
+kai-sim-consumer = "kai_sim_cowork.consumer:main"
+kai-sim-provision = "kai_sim_cowork.provision:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "ruff>=0.11",
+  "pip-audit>=2.9",
+  "pyinstaller>=6.11",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kai_sim_cowork"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+extend-exclude = ["build", "dist", "graphify-out"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.coverage.run]
+source = ["kai_sim_cowork", "scripts"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
